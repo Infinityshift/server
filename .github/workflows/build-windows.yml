@@ -1,0 +1,56 @@
+# Builds LandSandBoat for Windows on GitHub's servers and publishes
+# a ready-to-run zip on this repo's Releases page.
+# Run it from the Actions tab -> "Build Windows server package" -> "Run workflow".
+
+name: Build Windows server package
+
+on:
+  workflow_dispatch:   # only runs when you press the button
+
+permissions:
+  contents: write      # needed to create the release
+
+jobs:
+  build:
+    runs-on: windows-2022   # a Windows machine with Visual Studio 2022 already installed
+    steps:
+      - name: Get the server code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure the build
+        run: cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release
+
+      - name: Compile the server
+        run: cmake --build build --config Release --parallel
+
+      - name: Check the programs were built
+        shell: pwsh
+        run: |
+          # Make sure the server programs and their DLLs end up in the main folder
+          Get-ChildItem build -Recurse -Include xi_*.exe, *.dll | ForEach-Object {
+            if (-not (Test-Path $_.Name)) { Copy-Item $_.FullName . }
+          }
+          $exes = Get-ChildItem -Filter "xi_*.exe"
+          $exes | ForEach-Object { Write-Host "Built: $($_.Name)" }
+          if ($exes.Count -lt 4) { throw "Expected 4 xi_*.exe programs, found $($exes.Count)" }
+
+      - name: Package everything into a zip
+        shell: pwsh
+        run: |
+          $out = "package/server"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          # Copy everything the server needs, skipping git data and build leftovers
+          Get-ChildItem -Force |
+            Where-Object { $_.Name -notin @('.git', '.github', 'build', 'package') } |
+            Copy-Item -Destination $out -Recurse -Force
+          Compress-Archive -Path $out -DestinationPath "lsb-windows.zip"
+
+      - name: Publish the zip as a release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: windows-build-${{ github.run_number }}
+          name: Windows build ${{ github.run_number }}
+          body: Built from commit ${{ github.sha }}
+          files: lsb-windows.zip
