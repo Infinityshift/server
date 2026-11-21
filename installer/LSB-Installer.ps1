@@ -60,6 +60,19 @@ public static class LsbConsole {
         return ok;
     }
 }
+
+// Dark title bar (Windows 10 2004+ and Windows 11). Older Windows ignores it.
+public static class LsbWindow {
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+    public static void SetDarkTitleBar(IntPtr hwnd, bool dark) {
+        int value = dark ? 1 : 0;
+        try {
+            if (DwmSetWindowAttribute(hwnd, 20, ref value, 4) != 0) {   // DWMWA_USE_IMMERSIVE_DARK_MODE
+                DwmSetWindowAttribute(hwnd, 19, ref value, 4);          // same, on early Windows 10 builds
+            }
+        } catch { }
+    }
+}
 '@
 
 # ----------------------------------------------------------------------------
@@ -387,14 +400,20 @@ function Stop-Database {
 # Server processes
 # ----------------------------------------------------------------------------
 # Start order. Stop happens in the reverse order.
+# LogName = the server's log file (log\<LogName>-server.log), which is where it
+#           announces "The <LogName>-server is ready to work" once it has loaded.
+# ReadySeconds = how long to wait for that before giving up and moving on.
 $script:Components = @(
-    [pscustomobject]@{ Key = 'db';      Label = 'Database (MariaDB)'; Names = @('mariadbd', 'mysqld'); Exe = $null },
-    [pscustomobject]@{ Key = 'connect'; Label = 'Connect (login)';    Names = @('xi_connect'); Exe = 'xi_connect.exe' },
-    [pscustomobject]@{ Key = 'search';  Label = 'Search';             Names = @('xi_search');  Exe = 'xi_search.exe' },
-    [pscustomobject]@{ Key = 'world';   Label = 'World';              Names = @('xi_world');   Exe = 'xi_world.exe' },
-    [pscustomobject]@{ Key = 'profile'; Label = 'Profile';            Names = @('xi_profile'); Exe = 'xi_profile.exe' },
-    [pscustomobject]@{ Key = 'map';     Label = 'Map (game world)';   Names = @('xi_map');     Exe = 'xi_map.exe' }
+    [pscustomobject]@{ Key = 'db';      Label = 'Database (MariaDB)'; Names = @('mariadbd', 'mysqld'); Exe = $null;            LogName = $null;      ReadySeconds = 0 },
+    [pscustomobject]@{ Key = 'connect'; Label = 'Connect (login)';    Names = @('xi_connect');         Exe = 'xi_connect.exe'; LogName = 'connect';  ReadySeconds = 60 },
+    [pscustomobject]@{ Key = 'search';  Label = 'Search';             Names = @('xi_search');          Exe = 'xi_search.exe';  LogName = 'search';   ReadySeconds = 60 },
+    [pscustomobject]@{ Key = 'world';   Label = 'World';              Names = @('xi_world');           Exe = 'xi_world.exe';   LogName = 'world';    ReadySeconds = 120 },
+    [pscustomobject]@{ Key = 'profile'; Label = 'Profile';            Names = @('xi_profile');         Exe = 'xi_profile.exe'; LogName = 'profile';  ReadySeconds = 60 },
+    [pscustomobject]@{ Key = 'map';     Label = 'Map (game world)';   Names = @('xi_map');             Exe = 'xi_map.exe';     LogName = 'map';      ReadySeconds = 600 }
 )
+
+# Servers that are running but haven't finished loading yet (shown in yellow)
+$script:Starting = @{}
 
 function Get-Running([string]$key) {
     $c = $script:Components | Where-Object { $_.Key -eq $key }
@@ -423,39 +442,131 @@ function Wait-ProcessesExit($procs, [int]$seconds) {
     return $false
 }
 
-function Start-Server {
+function Get-LogPath($c) {
+    return Join-Path $script:P.Server ("log\{0}-server.log" -f $c.LogName)
+}
+
+function Get-FileLength([string]$path) {
+    if (Test-Path $path) { return (Get-Item $path).Length }
+    return 0
+}
+
+# Reads whatever was added to a log file after position $offset.
+# The server keeps the file open, so it's opened in "share" mode.
+function Read-LogFrom([string]$path, [long]$offset) {
+    if (-not (Test-Path $path)) { return '' }
+    $fs = New-Object IO.FileStream($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try {
+        if ($offset -gt $fs.Length) { $offset = 0 }   # the file was cleared or replaced
+        [void]$fs.Seek($offset, [IO.SeekOrigin]::Begin)
+        $reader = New-Object IO.StreamReader($fs)
+        return $reader.ReadToEnd()
+    } finally {
+        $fs.Close()
+    }
+}
+
+# Waits until the server writes "...-server is ready to work" in its log.
+# Returns 'ready', 'stopped' (it closed) or 'timeout'.
+function Wait-ServerReady($c, [long]$logOffset) {
+    $path = Get-LogPath $c
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $lastNote = 0
+    while ($sw.Elapsed.TotalSeconds -lt $c.ReadySeconds) {
+        Wait-Ms 1000
+        Update-Status
+        $text = ''
+        try { $text = Read-LogFrom $path $logOffset } catch { }
+        if ($text -match 'ready to work') { return 'ready' }
+        if (-not (Get-Running $c.Key)) { return 'stopped' }
+        $secs = [int]$sw.Elapsed.TotalSeconds
+        if ($secs - $lastNote -ge 15) {
+            $lastNote = $secs
+            Log ("  ...{0} is still loading ({1} seconds so far)" -f $c.Label, $secs)
+        }
+        Set-Progress 0 ("Waiting for {0} to finish loading... {1}s" -f $c.Label, $secs)
+    }
+    return 'timeout'
+}
+
+# Starts everything that isn't running yet, one at a time, waiting for each
+# to finish loading. -QuietIfRunning skips the "already running" lines.
+function Start-Server([switch]$QuietIfRunning) {
     [void](Start-Database)
     $style = if ($script:ShowWindows.Checked) { 'Minimized' } else { 'Hidden' }
+    $allReady = $true
     foreach ($c in $script:Components | Where-Object { $_.Exe }) {
         $exe = Join-Path $script:P.Server $c.Exe
         if (-not (Test-Path $exe)) { continue }          # e.g. older builds have no xi_profile
-        if (Get-Running $c.Key) { Log "$($c.Label) is already running."; continue }
+        if (Get-Running $c.Key) {
+            if (-not $QuietIfRunning) { Log "$($c.Label) is already running." }
+            continue
+        }
+
+        # Remember where the log ends now, so only NEW lines are checked for "ready"
+        $logOffset = Get-FileLength (Get-LogPath $c)
+
         Log "Starting $($c.Label)..."
         Start-Process -FilePath $exe -WorkingDirectory $script:P.Server -WindowStyle $style | Out-Null
-        Wait-Ms 2000
-        if (-not (Get-Running $c.Key)) { Log "WARNING: $($c.Label) closed right after starting. Check the Logs folder." }
+        $script:Starting[$c.Key] = $true
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+
+        try {
+            $result = Wait-ServerReady $c $logOffset
+        } finally {
+            $script:Starting.Remove($c.Key)
+        }
+
+        switch ($result) {
+            'ready'   { Log ("{0} is ready ({1:N0} seconds)." -f $c.Label, $sw.Elapsed.TotalSeconds) }
+            'stopped' { $allReady = $false; Log "WARNING: $($c.Label) closed while starting. Click Logs and open $($c.LogName)-server.log to see why." }
+            'timeout' { $allReady = $false; Log "WARNING: $($c.Label) didn't say it was ready within $($c.ReadySeconds) seconds. It may still be loading - check $($c.LogName)-server.log." }
+        }
     }
-    Log "Server started. Windows Firewall may ask about xi_* programs the first time - allow them if other people will connect."
+    Update-Status
+    if ($allReady) {
+        Log "Server is ready - you can log in now."
+    } else {
+        Log "Server started, but something above needs a look before logging in."
+    }
+}
+
+# Stops one server program cleanly (Ctrl+C), forcing it only if it hangs
+function Stop-Component($c) {
+    $procs = @(Get-Running $c.Key)
+    if ($procs.Count -eq 0) { return }
+    $canCtrlC = -not [LsbConsole]::HasOwnConsole()
+    Log "Stopping $($c.Label)..."
+    foreach ($p in $procs) {
+        $sent = $false
+        if ($canCtrlC) { $sent = [LsbConsole]::SendCtrlC([uint32]$p.Id) }
+        if (-not $sent) { Log "  (could not send Ctrl+C, closing it directly)"; $p | Stop-Process -Force -ErrorAction SilentlyContinue }
+    }
+    if (-not (Wait-ProcessesExit $procs 30)) {
+        Log "  $($c.Label) did not close within 30 seconds - forcing it to close."
+        $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Stop-GameServers {
     $ordered = @($script:Components | Where-Object { $_.Exe })
     [array]::Reverse($ordered)
-    $canCtrlC = -not [LsbConsole]::HasOwnConsole()
-    foreach ($c in $ordered) {
-        $procs = @(Get-Running $c.Key)
-        if ($procs.Count -eq 0) { continue }
-        Log "Stopping $($c.Label)..."
-        foreach ($p in $procs) {
-            $sent = $false
-            if ($canCtrlC) { $sent = [LsbConsole]::SendCtrlC([uint32]$p.Id) }
-            if (-not $sent) { Log "  (could not send Ctrl+C, closing it directly)"; $p | Stop-Process -Force -ErrorAction SilentlyContinue }
-        }
-        if (-not (Wait-ProcessesExit $procs 30)) {
-            Log "  $($c.Label) did not close within 30 seconds - forcing it to close."
-            $procs | Stop-Process -Force -ErrorAction SilentlyContinue
-        }
+    foreach ($c in $ordered) { Stop-Component $c }
+}
+
+# Restarts only the map server, which runs all the Lua scripts and modules.
+# The database and the login/world/search servers keep running. Anything
+# else that happens to be stopped is started too.
+function Restart-MapServer {
+    $map = $script:Components | Where-Object { $_.Key -eq 'map' }
+    if (-not (Test-Path (Join-Path $script:P.Server $map.Exe))) { throw "xi_map.exe was not found in the server folder." }
+
+    if (Get-Running 'map') {
+        if (-not (Ask-YesNo "Restart the map server?`n`nAnyone logged in will be disconnected. Log out first, then log back in once it says it's ready.")) { return }
+        Stop-Component $map
     }
+
+    Start-Server -QuietIfRunning
 }
 
 function Stop-Server {
@@ -575,11 +686,11 @@ function Install-Server([string]$root, [int]$port) {
     New-Item -ItemType Directory -Force (Split-Path $PointerFile -Parent) | Out-Null
     Set-Content $PointerFile $root
     if ($SelfIsExe) {
-        $panel = Join-Path $root 'LSB Control Panel.exe'
-        Copy-Item $SelfPath $panel -Force
+        $panelExe = Join-Path $root 'LSB Control Panel.exe'
+        Copy-Item $SelfPath $panelExe -Force
         $ws = New-Object -ComObject WScript.Shell
         $sc = $ws.CreateShortcut((Join-Path ([Environment]::GetFolderPath('Desktop')) 'LSB Control Panel.lnk'))
-        $sc.TargetPath = $panel
+        $sc.TargetPath = $panelExe
         $sc.WorkingDirectory = $root
         $sc.Save()
         Log "Added 'LSB Control Panel' to your desktop."
@@ -723,8 +834,11 @@ function New-Label([string]$text, [int]$x, [int]$y, [int]$w = 300) {
 }
 
 # --- shared bottom area: progress + log ---
-$script:StatusText = New-Label 'Ready' 12 392 740
+$script:StatusText = New-Label 'Ready' 12 392 620
 $form.Controls.Add($script:StatusText)
+$script:DarkModeBox = New-Object Windows.Forms.CheckBox
+$script:DarkModeBox.Text = 'Dark mode'; $script:DarkModeBox.Location = New-Object Drawing.Point(652, 390); $script:DarkModeBox.Size = New-Object Drawing.Size(100, 22)
+$form.Controls.Add($script:DarkModeBox)
 $script:Progress = New-Object Windows.Forms.ProgressBar
 $script:Progress.Location = New-Object Drawing.Point(12, 416); $script:Progress.Size = New-Object Drawing.Size(740, 18)
 $form.Controls.Add($script:Progress)
@@ -732,7 +846,6 @@ $script:LogBox = New-Object Windows.Forms.TextBox
 $script:LogBox.Multiline = $true; $script:LogBox.ReadOnly = $true; $script:LogBox.ScrollBars = 'Vertical'
 $script:LogBox.Location = New-Object Drawing.Point(12, 440); $script:LogBox.Size = New-Object Drawing.Size(740, 150)
 $script:LogBox.Font = New-Object Drawing.Font('Consolas', 8.5)
-$script:LogBox.BackColor = [Drawing.Color]::White
 $form.Controls.Add($script:LogBox)
 
 # --- install screen ---
@@ -758,6 +871,7 @@ $installPanel.Controls.Add($portBox)
 $installPanel.Controls.Add((New-Label '(leave as is unless something else already uses it)' 240 155 400))
 $installBtn = New-Button 'Install' 20 200 200
 $installBtn.Font = New-Object Drawing.Font('Segoe UI', 10, [Drawing.FontStyle]::Bold); $installBtn.Height = 40
+$installBtn.Tag = 'start'
 $installPanel.Controls.Add($installBtn)
 $form.Controls.Add($installPanel)
 
@@ -772,6 +886,7 @@ $y = 25
 foreach ($c in $script:Components) {
     $dot = New-Label ([string][char]0x25CF) 15 ($y - 4) 24
     $dot.Font = New-Object Drawing.Font('Segoe UI', 14); $dot.Height = 28; $dot.ForeColor = [Drawing.Color]::Gray
+    $dot.Tag = 'light'   # status light: its color is set by Update-Status, not the theme
     $statusGroup.Controls.Add($dot)
     $statusGroup.Controls.Add((New-Label $c.Label 42 $y 200))
     $script:Lights[$c.Key] = $dot
@@ -781,13 +896,17 @@ $panel.Controls.Add($statusGroup)
 
 $startBtn = New-Button 'Start' 300 20 140
 $startBtn.Font = New-Object Drawing.Font('Segoe UI', 10, [Drawing.FontStyle]::Bold); $startBtn.Height = 44
-$startBtn.BackColor = [Drawing.Color]::FromArgb(220, 245, 220)
+$startBtn.Tag = 'start'
 $stopBtn = New-Button 'Stop' 450 20 140
 $stopBtn.Font = $startBtn.Font; $stopBtn.Height = 44
-$stopBtn.BackColor = [Drawing.Color]::FromArgb(250, 225, 225)
+# Restarts only xi_map - enough after changing Lua modules or scripts
+$restartMapBtn = New-Button 'Restart map' 600 20 140
+$restartMapBtn.Font = $startBtn.Font; $restartMapBtn.Height = 44
+$stopBtn.Tag = 'stop'
+$restartMapBtn.Tag = 'restart'
 $script:ShowWindows = New-Object Windows.Forms.CheckBox
 $script:ShowWindows.Text = 'Show server windows (minimized)'; $script:ShowWindows.Location = New-Object Drawing.Point(300, 72); $script:ShowWindows.Size = New-Object Drawing.Size(300, 22)
-$panel.Controls.AddRange(@($startBtn, $stopBtn, $script:ShowWindows))
+$panel.Controls.AddRange(@($startBtn, $stopBtn, $restartMapBtn, $script:ShowWindows))
 
 $folderGroup = New-Object Windows.Forms.GroupBox
 $folderGroup.Text = 'Open folder'; $folderGroup.Location = New-Object Drawing.Point(300, 105); $folderGroup.Size = New-Object Drawing.Size(450, 65)
@@ -811,21 +930,26 @@ $script:InfoLabel.Height = 60
 $panel.Controls.Add($script:InfoLabel)
 $form.Controls.Add($panel)
 
-$script:AllButtons = @($installBtn, $browseBtn, $startBtn, $stopBtn, $backupBtn, $dbUpdateBtn, $updateBtn)
+$script:AllButtons = @($installBtn, $browseBtn, $startBtn, $stopBtn, $restartMapBtn, $backupBtn, $dbUpdateBtn, $updateBtn)
 function Set-ButtonsEnabled([bool]$on) { foreach ($b in $script:AllButtons) { $b.Enabled = $on } }
 
 function Update-Status {
-    if (-not $script:P -or -not $panel.Visible) { return }
+    if (-not $script:P -or -not $script:panel.Visible) { return }
     foreach ($c in $script:Components) {
         $dot = $script:Lights[$c.Key]
         if ($c.Exe -and -not (Test-Path (Join-Path $script:P.Server $c.Exe))) { $dot.ForeColor = [Drawing.Color]::LightGray; continue }
-        $dot.ForeColor = if (Get-Running $c.Key) { [Drawing.Color]::LimeGreen } else { [Drawing.Color]::Firebrick }
+        if (Get-Running $c.Key) {
+            # Yellow = running but still loading; green = ready
+            $dot.ForeColor = if ($script:Starting[$c.Key]) { [Drawing.Color]::Gold } else { [Drawing.Color]::LimeGreen }
+        } else {
+            $dot.ForeColor = [Drawing.Color]::Firebrick
+        }
     }
 }
 
 function Show-Panel {
-    $installPanel.Visible = $false
-    $panel.Visible = $true
+    $script:installPanel.Visible = $false
+    $script:panel.Visible = $true
     $build = ''
     $bi = Join-Path $script:P.Server 'BUILD-INFO.txt'
     if (Test-Path $bi) { $build = (Get-Content $bi -Raw).Trim() }
@@ -842,6 +966,7 @@ $browseBtn.Add_Click({
 $installBtn.Add_Click({ Run-Action 'Install' { Install-Server $folderBox.Text ([int]$portBox.Value) } })
 $startBtn.Add_Click({ Run-Action 'Start server' { Start-Server } })
 $stopBtn.Add_Click({ Run-Action 'Stop server' { Stop-Server } })
+$restartMapBtn.Add_Click({ Run-Action 'Restart map server' { Restart-MapServer } })
 $backupBtn.Add_Click({ Run-Action 'Back up database' { Backup-Database } })
 $dbUpdateBtn.Add_Click({ Run-Action 'Apply database updates' { Update-Database } })
 $updateBtn.Add_Click({ Run-Action 'Update server' { Update-Server } })
@@ -861,7 +986,7 @@ $form.Add_FormClosing({
         Show-Info 'Please wait for the current task to finish.'
         $e.Cancel = $true; return
     }
-    if ($script:P -and $panel.Visible -and ((Test-AnyGameRunning) -or (Get-Running 'db'))) {
+    if ($script:P -and $script:panel.Visible -and ((Test-AnyGameRunning) -or (Get-Running 'db'))) {
         $answer = [Windows.Forms.MessageBox]::Show("The server is still running.`n`nYes = stop it, then close`nNo = leave it running and close`nCancel = don't close", $AppTitle, 'YesNoCancel', 'Question')
         if ($answer -eq 'Cancel') { $e.Cancel = $true; return }
         if ($answer -eq 'Yes') {
@@ -871,6 +996,125 @@ $form.Add_FormClosing({
         }
     }
 })
+
+# ----------------------------------------------------------------------------
+# Look: dark / light theme and the window icon
+# ----------------------------------------------------------------------------
+$UiSettingsFile = Join-Path $env:APPDATA 'LSB-Panel\ui.json'
+
+function Get-DarkModeSetting {
+    try {
+        if (Test-Path $UiSettingsFile) {
+            $ui = Get-Content $UiSettingsFile -Raw | ConvertFrom-Json
+            if ($null -ne $ui.DarkMode) { return [bool]$ui.DarkMode }
+        }
+    } catch { }
+    return $true   # dark by default
+}
+
+function Save-DarkModeSetting([bool]$dark) {
+    try {
+        New-Item -ItemType Directory -Force (Split-Path $UiSettingsFile -Parent) | Out-Null
+        @{ DarkMode = $dark } | ConvertTo-Json | Set-Content $UiSettingsFile -Encoding UTF8
+    } catch { }
+}
+
+function New-Rgb([int]$r, [int]$g, [int]$b) { return [Drawing.Color]::FromArgb($r, $g, $b) }
+
+$script:Themes = @{
+    Dark = @{
+        Back = New-Rgb 30 31 34;    Surface = New-Rgb 43 45 49;  Hover = New-Rgb 55 58 64
+        Input = New-Rgb 22 23 26;   Text = New-Rgb 227 229 232;  Muted = New-Rgb 160 165 172
+        Border = New-Rgb 70 74 80
+        Accent = @{
+            start   = @{ Back = New-Rgb 31 77 54;  Border = New-Rgb 46 125 85;  Hover = New-Rgb 39 96 67 }
+            stop    = @{ Back = New-Rgb 90 38 38;  Border = New-Rgb 140 58 58;  Hover = New-Rgb 110 47 47 }
+            restart = @{ Back = New-Rgb 34 64 94;  Border = New-Rgb 53 103 154; Hover = New-Rgb 42 79 115 }
+        }
+    }
+    Light = @{
+        Back = [Drawing.SystemColors]::Control; Surface = [Drawing.SystemColors]::Control; Hover = [Drawing.SystemColors]::ControlLight
+        Input = [Drawing.SystemColors]::Window; Text = [Drawing.SystemColors]::ControlText; Muted = [Drawing.SystemColors]::ControlText
+        Border = [Drawing.SystemColors]::ControlDark
+        Accent = @{
+            start   = @{ Back = New-Rgb 220 245 220 }
+            stop    = @{ Back = New-Rgb 250 225 225 }
+            restart = @{ Back = New-Rgb 225 235 250 }
+        }
+    }
+}
+
+function Set-ControlTheme($parent, $t, [bool]$dark) {
+    foreach ($c in $parent.Controls) {
+        if ($c -is [Windows.Forms.Button]) {
+            $accent = if ($c.Tag) { $t.Accent[[string]$c.Tag] } else { $null }
+            $c.ForeColor = $t.Text
+            if ($dark) {
+                $c.FlatStyle = 'Flat'
+                $c.UseVisualStyleBackColor = $false
+                $c.BackColor = if ($accent) { $accent.Back } else { $t.Surface }
+                $c.FlatAppearance.BorderColor = if ($accent) { $accent.Border } else { $t.Border }
+                $c.FlatAppearance.MouseOverBackColor = if ($accent) { $accent.Hover } else { $t.Hover }
+                $c.FlatAppearance.MouseDownBackColor = $t.Border
+            } else {
+                $c.FlatStyle = 'Standard'
+                if ($accent) { $c.UseVisualStyleBackColor = $false; $c.BackColor = $accent.Back }
+                else { $c.BackColor = [Drawing.SystemColors]::Control; $c.UseVisualStyleBackColor = $true }
+            }
+        } elseif ($c -is [Windows.Forms.TextBox] -or $c -is [Windows.Forms.NumericUpDown]) {
+            $c.BackColor = $t.Input
+            $c.ForeColor = $t.Text
+            $c.BorderStyle = if ($dark) { 'FixedSingle' } else { 'Fixed3D' }
+        } elseif ($c -is [Windows.Forms.CheckBox]) {
+            $c.ForeColor = $t.Text
+            $c.FlatStyle = if ($dark) { 'Flat' } else { 'Standard' }
+        } elseif ($c -is [Windows.Forms.GroupBox]) {
+            $c.ForeColor = $t.Muted
+        } elseif ($c -is [Windows.Forms.Label]) {
+            if ($c.Tag -ne 'light') { $c.ForeColor = $t.Text }
+        } elseif ($c -is [Windows.Forms.Panel]) {
+            $c.BackColor = $t.Back
+        }
+
+        if ($c.Controls.Count -gt 0 -and -not ($c -is [Windows.Forms.NumericUpDown])) {
+            Set-ControlTheme $c $t $dark
+        }
+    }
+}
+
+function Set-Theme([bool]$dark) {
+    $t = if ($dark) { $script:Themes.Dark } else { $script:Themes.Light }
+    $form.BackColor = $t.Back
+    $form.ForeColor = $t.Text
+    Set-ControlTheme $form $t $dark
+    $script:InfoLabel.ForeColor = $t.Muted
+    if ($form.IsHandleCreated) {
+        [LsbWindow]::SetDarkTitleBar($form.Handle, $dark)
+        # nudge Windows into redrawing the title bar straight away
+        $form.Width += 1; $form.Width -= 1
+    }
+}
+
+# The title bar can only be changed once the window exists
+$form.Add_HandleCreated({ [LsbWindow]::SetDarkTitleBar($form.Handle, $script:DarkModeBox.Checked) })
+
+$script:DarkModeBox.Checked = Get-DarkModeSetting
+Set-Theme $script:DarkModeBox.Checked
+$script:DarkModeBox.Add_CheckedChanged({
+    Set-Theme $script:DarkModeBox.Checked
+    Save-DarkModeSetting $script:DarkModeBox.Checked
+})
+
+# Window icon (taskbar and title bar). The .exe carries the icon that ps2exe
+# built into it; when running the .ps1 itself, lsb-icon.ico next to it is used.
+try {
+    if ($SelfIsExe) {
+        $form.Icon = [Drawing.Icon]::ExtractAssociatedIcon($SelfPath)
+    } else {
+        $iconFile = Join-Path (Split-Path $SelfPath -Parent) 'lsb-icon.ico'
+        if (Test-Path $iconFile) { $form.Icon = New-Object Drawing.Icon($iconFile) }
+    }
+} catch { }
 
 # --- start up: control panel if installed, otherwise the install screen ---
 $existing = Find-Install
