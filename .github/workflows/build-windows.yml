@@ -1,6 +1,14 @@
 # Builds LandSandBoat for Windows on GitHub's servers and publishes
-# a ready-to-run zip on this repo's Releases page.
+# a ready-to-run package on this repo's Releases page.
 # Run it from the Actions tab -> "Build Windows server package" -> "Run workflow".
+#
+# The release contains:
+#   lsb-windows.zip    server/   = the LSB server (programs, scripts, sql, meshes)
+#                      runtime/  = portable Python (with packages), MariaDB and Git
+#   LSB-Installer.exe  the installer / control panel (built from installer/LSB-Installer.ps1)
+#
+# Only actions/checkout is used from the marketplace. Everything else is plain
+# PowerShell / cmd, so there are no Node 20 deprecation warnings.
 
 name: Build Windows server package
 
@@ -10,34 +18,81 @@ on:
 permissions:
   contents: write      # needed to create the release
 
+env:
+  # Change these to update the bundled versions.
+  PYTHON_SERIES: '3.12'          # newest 3.12.x from python-build-standalone is used
+  MARIADB_VERSION: '10.11.19'    # MariaDB 10.11 is supported until Feb 2028
+
 jobs:
   build:
     runs-on: windows-2022   # a Windows machine with Visual Studio 2022 already installed
+    env:
+      GH_TOKEN: ${{ github.token }}   # lets the gh tool download files and make the release
+      RT: ${{ github.workspace }}\..\runtime   # portable tools are put here, outside the code folder
     steps:
       - name: Get the server code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
-      - name: Set up Python
-        id: py
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+      # ---------- Portable tools that go in the zip ----------
 
-      - name: Install the Python packages the build needs
-        run: python -m pip install -r tools/requirements.txt
+      - name: Download portable Python and install the server's Python packages
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force "$env:RT\dl" | Out-Null
+          # python-build-standalone makes a Python that keeps working after you move its folder
+          gh release download --repo astral-sh/python-build-standalone `
+            --pattern "cpython-$($env:PYTHON_SERIES).*-x86_64-pc-windows-msvc-install_only.tar.gz" `
+            --dir "$env:RT\dl"
+          $tgz = Get-ChildItem "$env:RT\dl\cpython-*.tar.gz" | Select-Object -First 1
+          Write-Host "Using $($tgz.Name)"
+          & "$env:SystemRoot\System32\tar.exe" -xzf $tgz.FullName -C $env:RT   # creates $RT\python (Windows tar, not Git's)
+          & "$env:RT\python\python.exe" -m pip install --upgrade pip
+          & "$env:RT\python\python.exe" -m pip install -r tools/requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+          & "$env:RT\python\python.exe" --version
 
-      - name: Set up the Visual Studio compiler
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
+      - name: Download portable MariaDB
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = $env:MARIADB_VERSION
+          $url = "https://archive.mariadb.org/mariadb-$v/winx64-packages/mariadb-$v-winx64.zip"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest $url -OutFile "$env:RT\dl\mariadb.zip"
+          7z x "$env:RT\dl\mariadb.zip" "-o$env:RT\dl\mdb" -y | Out-Null
+          Move-Item (Get-ChildItem "$env:RT\dl\mdb" -Directory | Select-Object -First 1).FullName "$env:RT\mariadb"
+          # Not needed to run the server - removing them keeps the zip smaller
+          foreach ($x in 'include', 'mysql-test', 'sql-bench') {
+            if (Test-Path "$env:RT\mariadb\$x") { Remove-Item "$env:RT\mariadb\$x" -Recurse -Force }
+          }
+          Get-ChildItem "$env:RT\mariadb\bin" -Filter *.pdb | Remove-Item -Force
+          if (-not (Test-Path "$env:RT\mariadb\bin\mysql.exe")) { throw "mysql.exe missing from MariaDB package" }
 
-      - name: Configure the build
-        run: cmake -S . -B build -G "Ninja Multi-Config" -DPython_EXECUTABLE="${{ steps.py.outputs.python-path }}"
+      - name: Download portable Git (dbtool.py needs git)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # MinGit = the small, portable version of Git for Windows.
+          # The pattern skips the "busybox" variant.
+          gh release download --repo git-for-windows/git --pattern "MinGit-*[0-9]-64-bit.zip" --dir "$env:RT\dl"
+          $zip = Get-ChildItem "$env:RT\dl\MinGit-*.zip" | Select-Object -First 1
+          Write-Host "Using $($zip.Name)"
+          7z x $zip.FullName "-o$env:RT\git" -y | Out-Null
+          & "$env:RT\git\cmd\git.exe" --version
+
+      # ---------- Build the server ----------
 
       - name: Compile the server
-        run: cmake --build build --config Release --parallel
+        shell: cmd
+        run: |
+          rem Find Visual Studio and load its compiler settings (replaces the old msvc-dev-cmd action)
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake -S . -B build -G "Ninja Multi-Config" -DPython_EXECUTABLE="%RT%\python\python.exe" || exit /b 1
+          cmake --build build --config Release --parallel || exit /b 1
 
       - name: Check the programs were built
         shell: pwsh
@@ -48,23 +103,65 @@ jobs:
           }
           $exes = Get-ChildItem -Filter "xi_*.exe"
           $exes | ForEach-Object { Write-Host "Built: $($_.Name)" }
-          if ($exes.Count -lt 4) { throw "Expected 4 xi_*.exe programs, found $($exes.Count)" }
+          foreach ($need in 'xi_connect.exe', 'xi_search.exe', 'xi_world.exe', 'xi_map.exe') {
+            if (-not (Test-Path $need)) { throw "$need was not built" }
+          }
+
+      # ---------- Package ----------
 
       - name: Package everything into a zip
         shell: pwsh
         run: |
-          $out = "package/server"
-          New-Item -ItemType Directory -Force $out | Out-Null
-          # Copy everything the server needs, skipping git data and build leftovers
-          Get-ChildItem -Force |
-            Where-Object { $_.Name -notin @('.git', '.github', 'build', 'package') } |
-            Copy-Item -Destination $out -Recurse -Force
-          Compress-Archive -Path $out -DestinationPath "lsb-windows.zip"
+          $ErrorActionPreference = 'Stop'
+          $out = "$env:RUNNER_TEMP\package"
+          New-Item -ItemType Directory -Force "$out\server" | Out-Null
 
-      - name: Publish the zip as a release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: windows-build-${{ github.run_number }}
-          name: Windows build ${{ github.run_number }}
-          body: Built from commit ${{ github.sha }}
-          files: lsb-windows.zip
+          # Copy everything the server needs, skipping git data, build leftovers and the test program
+          Get-ChildItem -Force |
+            Where-Object { $_.Name -notin @('.git', '.github', 'build', 'installer') -and $_.Name -notlike 'xi_test*' } |
+            Copy-Item -Destination "$out\server" -Recurse -Force
+
+          # dbtool.py refuses to run unless the server folder is a git repo.
+          # Make a tiny placeholder repo: one empty commit, and git told to ignore every file
+          # (so it stays small and fast). Because of this, database updates must use "update full".
+          $git = "$env:RT\git\cmd\git.exe"
+          & $git -C "$out\server" init -q
+          Set-Content "$out\server\.git\info\exclude" '*'
+          & $git -C "$out\server" -c user.name=lsb-build -c user.email=build@localhost commit --allow-empty -q -m "LSB Windows build of ${{ github.sha }}"
+          if ($LASTEXITCODE -ne 0) { throw "could not create placeholder git repo" }
+
+          # Portable tools
+          New-Item -ItemType Directory -Force "$out\runtime" | Out-Null
+          foreach ($x in 'python', 'mariadb', 'git') { Move-Item "$env:RT\$x" "$out\runtime\$x" }
+
+          # Note which build this is (the installer shows it)
+          Set-Content "$out\server\BUILD-INFO.txt" "Build ${{ github.run_number }} from commit ${{ github.sha }}"
+
+          # 7-Zip is much faster than Compress-Archive for a package this big
+          Push-Location $out
+          7z a -tzip -mx=5 "$env:GITHUB_WORKSPACE\lsb-windows.zip" server runtime | Out-Null
+          Pop-Location
+          $size = (Get-Item lsb-windows.zip).Length / 1GB
+          Write-Host ("lsb-windows.zip is {0:N2} GB" -f $size)
+          if ($size -ge 2) { throw "Zip is over GitHub's 2 GB release-file limit" }
+
+      - name: Build the installer .exe
+        shell: powershell   # Windows PowerShell 5.1 - what ps2exe and the installer use
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path installer\LSB-Installer.ps1)) { Write-Host "No installer script yet - skipping"; exit 0 }
+          Install-Module ps2exe -Scope CurrentUser -Force
+          Import-Module ps2exe
+          Invoke-ps2exe -inputFile installer\LSB-Installer.ps1 -outputFile LSB-Installer.exe -noConsole -STA `
+            -title 'LSB Server Installer' -product 'LSB Server Installer' -version '1.0.${{ github.run_number }}'
+          if (-not (Test-Path LSB-Installer.exe)) { throw "ps2exe did not create LSB-Installer.exe" }
+
+      - name: Publish the release
+        shell: pwsh
+        run: |
+          $files = @('lsb-windows.zip')
+          if (Test-Path LSB-Installer.exe) { $files += 'LSB-Installer.exe' }
+          gh release create "windows-build-${{ github.run_number }}" @files `
+            --title "Windows build ${{ github.run_number }}" `
+            --notes "Built from commit ${{ github.sha }}"
+          if ($LASTEXITCODE -ne 0) { throw "release failed" }
