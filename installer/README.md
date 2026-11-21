@@ -29,5 +29,5 @@ the .exe version shuts them down cleanly.
 ## Building the .exe yourself (optional)
 ```powershell
 Install-Module ps2exe -Scope CurrentUser
-Invoke-ps2exe .\LSB-Installer.ps1 .\LSB-Installer.exe -noConsole -STA
+Invoke-ps2exe .\LSB-Installer.ps1 .\LSB-Installer.exe -noConsole -STA -iconFile .\lsb-icon.ico
 ```
