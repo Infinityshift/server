@@ -152,8 +152,11 @@ jobs:
           if (-not (Test-Path installer\LSB-Installer.ps1)) { Write-Host "No installer script yet - skipping"; exit 0 }
           Install-Module ps2exe -Scope CurrentUser -Force
           Import-Module ps2exe
+          # The icon goes into the .exe, so the taskbar, shortcut and file show it
+          $icon = @{}
+          if (Test-Path installer\lsb-icon.ico) { $icon.iconFile = 'installer\lsb-icon.ico' }
           Invoke-ps2exe -inputFile installer\LSB-Installer.ps1 -outputFile LSB-Installer.exe -noConsole -STA `
-            -title 'LSB Server Installer' -product 'LSB Server Installer' -version '1.0.${{ github.run_number }}'
+            -title 'LSB Server Installer' -product 'LSB Server Installer' -version '1.0.${{ github.run_number }}' @icon
           if (-not (Test-Path LSB-Installer.exe)) { throw "ps2exe did not create LSB-Installer.exe" }
 
       - name: Publish the release
