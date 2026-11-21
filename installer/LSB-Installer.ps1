@@ -23,6 +23,7 @@
 # ===================== Settings you may want to change =====================
 $GitHubRepo        = 'Infinityshift/server'   # where the releases come from
 $ZipAssetName      = 'lsb-windows.zip'
+$PanelAssetName    = 'LSB-Installer.exe'          # the control panel, in the same releases
 $MyModuleFolders   = @('infinityshift')       # always kept as-is when updating the server
 $DefaultInstallDir = 'C:\LSB'
 $DefaultDbPort     = 3307                     # 3306 is left free for any other MariaDB/MySQL
@@ -731,6 +732,76 @@ function Copy-IfExists([string]$from, [string]$to) {
     }
 }
 
+# ----------------------------------------------------------------------------
+# Update the control panel itself
+# ----------------------------------------------------------------------------
+# The build number is stamped into the .exe (ps2exe -version 1.0.<build>) and
+# into each release's tag (windows-build-<build>), so the two can be compared.
+function Get-MyBuildNumber {
+    # 1.0.<build> -> the third number ("build part"); 0 for a home-made build
+    try { return [int][Diagnostics.FileVersionInfo]::GetVersionInfo($SelfPath).FileBuildPart } catch { }
+    return 0
+}
+
+function Update-ControlPanel {
+    if (-not $SelfIsExe) { throw "This only works in the .exe version of the control panel." }
+
+    Log "Checking GitHub for a newer control panel..."
+    $rel = Invoke-RestMethod "https://api.github.com/repos/$GitHubRepo/releases/latest" -Headers @{ 'User-Agent' = 'LSB-Installer' }
+    $asset = $rel.assets | Where-Object { $_.name -eq $PanelAssetName } | Select-Object -First 1
+    if (-not $asset) { throw "The latest release ($($rel.tag_name)) has no $PanelAssetName." }
+
+    $latest  = if ($rel.tag_name -match '(\d+)$') { [int]$Matches[1] } else { 0 }
+    $current = Get-MyBuildNumber
+    Log "This control panel: build $current. Latest release: build $latest."
+
+    if ($current -ge $latest -and $current -gt 0) {
+        if (-not (Ask-YesNo "You already have the newest control panel (build $current).`n`nDownload it again anyway?")) { return }
+    } elseif (-not (Ask-YesNo "Update the control panel to build $latest?`n`nIt will close and reopen by itself. The server keeps running.")) {
+        return
+    }
+
+    $newFile = "$SelfPath.new"
+    $oldFile = $SelfPath -replace '\.exe$', '.old.exe'
+    if (Test-Path $newFile) { Remove-Item $newFile -Force }
+    Download-File $asset.browser_download_url $newFile
+
+    # Make sure what came down is a real Windows program, not an error page
+    $bytes = [IO.File]::ReadAllBytes($newFile)
+    if ($bytes.Length -lt 100KB -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) {
+        Remove-Item $newFile -Force -ErrorAction SilentlyContinue
+        throw "The download doesn't look like a program file. Nothing was changed."
+    }
+
+    # Windows won't let a running program be overwritten, but it can be renamed.
+    if (Test-Path $oldFile) { Remove-Item $oldFile -Force -ErrorAction SilentlyContinue }
+    Move-Item $SelfPath $oldFile -Force
+    try {
+        Move-Item $newFile $SelfPath -Force
+    } catch {
+        Move-Item $oldFile $SelfPath -Force   # put the old one back
+        throw "Could not put the new control panel in place: $($_.Exception.Message)"
+    }
+
+    Log "Control panel updated - reopening..."
+    Start-Process -FilePath $SelfPath -WorkingDirectory (Split-Path $SelfPath -Parent) | Out-Null
+    $script:Restarting = $true
+    $form.Close()
+}
+
+# Deletes the previous version left behind by an update (it may still be
+# closing when the new one starts, so this is retried by the status timer).
+$script:OldPanelCleaned = -not $SelfIsExe
+function Remove-OldPanel {
+    if ($script:OldPanelCleaned) { return }
+    $oldFile = $SelfPath -replace '\.exe$', '.old.exe'
+    if (-not (Test-Path $oldFile)) { $script:OldPanelCleaned = $true; return }
+    try {
+        Remove-Item $oldFile -Force -ErrorAction Stop
+        $script:OldPanelCleaned = $true
+    } catch { }
+}
+
 function Update-Server {
     $rel = Get-LatestRelease
     if ($rel.Tag -eq $script:Cfg.Release) {
@@ -918,19 +989,20 @@ $folderGroup.Controls.AddRange(@($openServerBtn, $openModulesBtn, $openSettingsB
 $panel.Controls.Add($folderGroup)
 
 $maintGroup = New-Object Windows.Forms.GroupBox
-$maintGroup.Text = 'Maintenance'; $maintGroup.Location = New-Object Drawing.Point(300, 175); $maintGroup.Size = New-Object Drawing.Size(450, 65)
+$maintGroup.Text = 'Maintenance'; $maintGroup.Location = New-Object Drawing.Point(300, 175); $maintGroup.Size = New-Object Drawing.Size(450, 102)
 $backupBtn   = New-Button 'Back up database' 10 22 135
 $dbUpdateBtn = New-Button 'Apply DB updates' 154 22 135
 $updateBtn   = New-Button 'Update server'    298 22 135
-$maintGroup.Controls.AddRange(@($backupBtn, $dbUpdateBtn, $updateBtn))
+$updatePanelBtn = New-Button 'Update control panel' 10 60 180
+$maintGroup.Controls.AddRange(@($backupBtn, $dbUpdateBtn, $updateBtn, $updatePanelBtn))
 $panel.Controls.Add($maintGroup)
 
-$script:InfoLabel = New-Label '' 12 255 740
+$script:InfoLabel = New-Label '' 12 290 740
 $script:InfoLabel.Height = 60
 $panel.Controls.Add($script:InfoLabel)
 $form.Controls.Add($panel)
 
-$script:AllButtons = @($installBtn, $browseBtn, $startBtn, $stopBtn, $restartMapBtn, $backupBtn, $dbUpdateBtn, $updateBtn)
+$script:AllButtons = @($installBtn, $browseBtn, $startBtn, $stopBtn, $restartMapBtn, $backupBtn, $dbUpdateBtn, $updateBtn, $updatePanelBtn)
 function Set-ButtonsEnabled([bool]$on) { foreach ($b in $script:AllButtons) { $b.Enabled = $on } }
 
 function Update-Status {
@@ -967,6 +1039,7 @@ $installBtn.Add_Click({ Run-Action 'Install' { Install-Server $folderBox.Text ([
 $startBtn.Add_Click({ Run-Action 'Start server' { Start-Server } })
 $stopBtn.Add_Click({ Run-Action 'Stop server' { Stop-Server } })
 $restartMapBtn.Add_Click({ Run-Action 'Restart map server' { Restart-MapServer } })
+$updatePanelBtn.Add_Click({ Run-Action 'Update control panel' { Update-ControlPanel } })
 $backupBtn.Add_Click({ Run-Action 'Back up database' { Backup-Database } })
 $dbUpdateBtn.Add_Click({ Run-Action 'Apply database updates' { Update-Database } })
 $updateBtn.Add_Click({ Run-Action 'Update server' { Update-Server } })
@@ -977,11 +1050,15 @@ $openLogsBtn.Add_Click({     Open-Folder (Join-Path $script:P.Server 'log') })
 
 $timer = New-Object Windows.Forms.Timer
 $timer.Interval = 2000
-$timer.Add_Tick({ if (-not $script:Busy) { Update-Status } })
+$timer.Add_Tick({
+    if (-not $script:Busy) { Update-Status }
+    Remove-OldPanel
+})
 $timer.Start()
 
 $form.Add_FormClosing({
     param($sender, $e)
+    if ($script:Restarting) { return }   # the control panel is updating itself; the server keeps running
     if ($script:Busy) {
         Show-Info 'Please wait for the current task to finish.'
         $e.Cancel = $true; return
