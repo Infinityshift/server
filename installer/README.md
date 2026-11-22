@@ -1,3 +1,4 @@
+# I am not a developer. All code was written with claude for a personal project.
 # LSB Windows Installer
 
 `LSB-Installer.ps1` is the installer and the control panel in one program.
