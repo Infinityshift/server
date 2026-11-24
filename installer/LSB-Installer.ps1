@@ -6,6 +6,8 @@
         your GitHub fork (server + portable Python, MariaDB and Git).
       * After that: a control panel with Start/Stop, status lights, folder
         buttons, backups, database updates and server updates.
+      * Developer section: rebuilds the map server (xi_map.exe) from source on
+        this PC, for testing C++ changes without waiting for GitHub.
 
     Written for Windows PowerShell 5.1 so ps2exe can turn it into an .exe:
         Invoke-ps2exe LSB-Installer.ps1 LSB-Installer.exe -noConsole -STA
@@ -15,6 +17,7 @@
         C:\LSB\runtime\           portable Python, MariaDB, Git (from the zip)
         C:\LSB\database\          the MariaDB data - never touched by updates
         C:\LSB\old\               previous versions kept after "Update server"
+        C:\LSB\source\            source code for rebuilding (only if you use the Developer section)
         C:\LSB\lsb-panel.json     this program's settings (DB port & password)
         C:\LSB\panel.log          everything shown in the log box
         C:\LSB\LSB Control Panel.exe
@@ -29,6 +32,7 @@ $DefaultInstallDir = 'C:\LSB'
 $DefaultDbPort     = 3307                     # 3306 is left free for any other MariaDB/MySQL
 $DbName            = 'xidb'
 $AppTitle          = 'LSB Server'
+$BuildToolsUrl     = 'https://visualstudio.microsoft.com/downloads/'   # where to get the C++ build tools
 # ==========================================================================
 
 $ErrorActionPreference = 'Stop'
@@ -98,6 +102,7 @@ function Get-Paths([string]$root) {
         DbData    = Join-Path $root 'database'
         Old       = Join-Path $root 'old'
         Downloads = Join-Path $root 'downloads'
+        Source    = Join-Path $root 'source'
         Config    = Join-Path $root 'lsb-panel.json'
         LogFile   = Join-Path $root 'panel.log'
     }
@@ -255,7 +260,10 @@ function Expand-ZipWithProgress([string]$zip, [string]$dest) {
 # ----------------------------------------------------------------------------
 # Running programs (output goes to the log box)
 # ----------------------------------------------------------------------------
-function Invoke-Logged([string]$exe, [string]$arguments, [string]$workDir) {
+# $OnLine (optional): called with each output line. Return $true to show the
+# line in the log, $false to hide it (used by the build to turn its many
+# "[12/900] Building..." lines into the progress bar instead).
+function Invoke-Logged([string]$exe, [string]$arguments, [string]$workDir, [scriptblock]$OnLine = $null) {
     $psi = New-Object Diagnostics.ProcessStartInfo
     $psi.FileName               = $exe
     $psi.Arguments              = $arguments
@@ -270,20 +278,27 @@ function Invoke-Logged([string]$exe, [string]$arguments, [string]$workDir) {
     1..5 | ForEach-Object { $p.StandardInput.WriteLine('n') }
     $p.StandardInput.Close()
 
+    $showLine = {
+        param([string]$line)
+        if ($line -match 'Using a password on the command line') { return }
+        if ($OnLine) {
+            if (& $OnLine $line) { Log $line }
+        } else {
+            Log $line
+        }
+    }
+
     $oT = $p.StandardOutput.ReadLineAsync()
     $eT = $p.StandardError.ReadLineAsync()
     while ($oT -or $eT) {
         $got = $false
         if ($oT -and $oT.IsCompleted) {
             $got = $true
-            if ($null -eq $oT.Result) { $oT = $null } else { Log $oT.Result; $oT = $p.StandardOutput.ReadLineAsync() }
+            if ($null -eq $oT.Result) { $oT = $null } else { & $showLine $oT.Result; $oT = $p.StandardOutput.ReadLineAsync() }
         }
         if ($eT -and $eT.IsCompleted) {
             $got = $true
-            if ($null -eq $eT.Result) { $eT = $null } else {
-                if ($eT.Result -notmatch 'Using a password on the command line') { Log $eT.Result }
-                $eT = $p.StandardError.ReadLineAsync()
-            }
+            if ($null -eq $eT.Result) { $eT = $null } else { & $showLine $eT.Result; $eT = $p.StandardError.ReadLineAsync() }
         }
         if (-not $got) { Pump; Start-Sleep -Milliseconds 50 }
     }
@@ -882,12 +897,267 @@ function Open-Folder([string]$path) {
 }
 
 # ----------------------------------------------------------------------------
+# Developer: rebuild the map server from source on this PC
+# ----------------------------------------------------------------------------
+# Needs Microsoft's free C++ build tools (Visual Studio or "Build Tools for
+# Visual Studio" with "Desktop development with C++"). The control panel can't
+# install those itself - it checks for them and explains how to get them.
+
+# Looks for Visual Studio's C++ compiler and its CMake/Ninja tools.
+# Returns Ok, Name, Path and (when something is missing) Problem.
+function Find-BuildTools {
+    $result = [pscustomobject]@{ Ok = $false; Name = ''; Path = ''; VcVars = ''; Problem = '' }
+    try {
+        # vswhere.exe comes with every Visual Studio / Build Tools install, and lists them
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+        if (-not (Test-Path $vswhere)) {
+            $result.Problem = "The C++ build tools are not installed on this PC."
+            return $result
+        }
+
+        $vcTools = 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64'   # the C++ compiler
+        $cmake   = 'Microsoft.VisualStudio.Component.VC.CMake.Project'  # CMake + Ninja
+
+        $path = @(& $vswhere -latest -products '*' -requires $vcTools -property installationPath) | Select-Object -First 1
+        if (-not $path) {
+            $result.Problem = "Visual Studio is installed, but without the C++ tools (the 'Desktop development with C++' workload)."
+            return $result
+        }
+        $result.Path = $path
+        $result.Name = @(& $vswhere -latest -products '*' -requires $vcTools -property displayName) | Select-Object -First 1
+
+        $withCmake = @(& $vswhere -latest -products '*' -requires $vcTools $cmake -property installationPath) | Select-Object -First 1
+        if (-not $withCmake) {
+            $result.Problem = "$($result.Name) has the C++ compiler, but not 'C++ CMake tools for Windows', which the build needs."
+            return $result
+        }
+
+        $result.VcVars = Join-Path $path 'VC\Auxiliary\Build\vcvars64.bat'
+        if (-not (Test-Path $result.VcVars)) {
+            $result.Problem = "$($result.Name) looks incomplete (vcvars64.bat is missing). Try 'Repair' in the Visual Studio Installer."
+            return $result
+        }
+
+        $result.Ok = $true
+    } catch {
+        $result.Problem = "Could not check for the C++ build tools: $($_.Exception.Message)"
+    }
+    return $result
+}
+
+# Explains what's missing and how to get it, then offers to open the download page
+function Show-BuildToolsHelp([string]$problem) {
+    Log "C++ build tools: $problem"
+    $msg = @"
+$problem
+
+To rebuild the server on this PC you need Microsoft's free C++ build tools. This is a one-time install (about 6-8 GB):
+
+1. Click Yes to open Microsoft's download page.
+2. Under "Tools for Visual Studio", download "Build Tools for Visual Studio".
+   (Visual Studio Community works too, if you also want the editor.)
+3. Run it. On the Workloads tab, tick "Desktop development with C++" and click Install.
+   If it's already installed, click Modify instead and tick the same thing.
+4. When it's finished, come back here and click "Check build tools".
+
+Open the download page now?
+"@
+    if (Ask-YesNo $msg) { Start-Process $BuildToolsUrl | Out-Null }
+}
+
+function Test-BuildToolsAction {
+    $t = Find-BuildTools
+    Update-DevStatus
+    if ($t.Ok) {
+        Log "C++ build tools found: $($t.Name) in $($t.Path)"
+        $next = if (Test-Path (Join-Path $script:P.Source '.git')) { "Click 'Rebuild map server' whenever you want to test a C++ change." } else { "Next, click 'Set up source' (one time) to download the source code." }
+        Show-Info "The C++ build tools are installed:`n$($t.Name)`n`n$next"
+    } else {
+        Show-BuildToolsHelp $t.Problem
+    }
+}
+
+# The exact commit the installed server was built from (from BUILD-INFO.txt)
+function Get-InstalledCommit {
+    $bi = Join-Path $script:P.Server 'BUILD-INFO.txt'
+    if ((Test-Path $bi) -and ((Get-Content $bi -Raw) -match 'commit\s+([0-9a-fA-F]{7,40})')) { return $Matches[1] }
+    return $null
+}
+
+function Invoke-Git([string]$arguments, [string]$workDir) {
+    $git = Join-Path $script:P.GitCmd 'git.exe'
+    if (-not (Test-Path $git)) { throw "The bundled Git was not found in $($script:P.GitCmd)." }
+    Log "Running: git $arguments"
+    return (Invoke-Logged $git $arguments $workDir)
+}
+
+# Downloads the source code (first time), then switches it to the exact
+# version the installed server was built from, so a rebuilt xi_map matches
+# the scripts and database.
+function Initialize-Source {
+    $src    = $script:P.Source
+    $commit = Get-InstalledCommit
+
+    if (Test-Path (Join-Path $src '.git')) {
+        if (-not (Ask-YesNo "The source code is already set up in:`n$src`n`nSwitch it to the version your server is running now? Your own C++ changes are kept. If Git says they're in the way, nothing is changed.")) { return }
+        if ((Invoke-Git "-C `"$src`" fetch origin" $script:P.Root) -ne 0) { throw "Could not download the latest code from GitHub (git fetch failed)." }
+    } else {
+        if ((Test-Path $src) -and (Get-ChildItem $src -Force | Select-Object -First 1)) {
+            throw "$src already has files in it but isn't a source folder. Move or delete them, then try again."
+        }
+        if (-not (Ask-YesNo "This downloads the server's source code from github.com/$GitHubRepo into:`n$src`n`nIt's about 1-2 GB and takes a few minutes. You only do this once.`n`nContinue?")) { return }
+        Set-Progress 0 'Downloading the source code...'
+        if ((Invoke-Git "clone --recursive https://github.com/$GitHubRepo.git `"$src`"" $script:P.Root) -ne 0) {
+            throw "Downloading the source code failed (git clone). Check your internet connection and try again."
+        }
+    }
+
+    if ($commit) {
+        Log "Switching the source code to the version your server runs ($commit)..."
+        if ((Invoke-Git "-C `"$src`" checkout --quiet $commit" $script:P.Root) -ne 0) {
+            throw "Could not switch to version $commit. If you changed files in the source folder, Git refuses so they aren't lost - see the log above for which files."
+        }
+    } else {
+        Log "BUILD-INFO.txt doesn't say which version the server is, so the newest code is used."
+    }
+    if ((Invoke-Git "-C `"$src`" submodule update --init --recursive" $script:P.Root) -ne 0) { throw "Updating the source code's submodules failed." }
+
+    Log "Source code is ready in $src"
+    Update-DevStatus
+    Show-Info "The source code is ready in:`n$src`n`nEdit the C++ files under src\ there, then click 'Rebuild map server'."
+}
+
+# Builds xi_map.exe from the source folder, then swaps it into the server.
+# The first build compiles everything (slow); later builds only redo what changed.
+function Build-MapServer {
+    $tools = Find-BuildTools
+    if (-not $tools.Ok) { Show-BuildToolsHelp $tools.Problem; return }
+
+    $src = $script:P.Source
+    if (-not (Test-Path (Join-Path $src 'CMakeLists.txt'))) {
+        Show-Info "The source code isn't set up yet.`n`nClick 'Set up source' first (one time)."
+        return
+    }
+
+    $firstBuild = -not (Test-Path (Join-Path $src 'build\CMakeCache.txt'))
+    if ($firstBuild) {
+        if (-not (Ask-YesNo "This is the first build, so everything gets compiled. Expect 20-40 minutes, longer on a slower PC. Later rebuilds only redo what you changed and are much faster.`n`nThe server can keep running while it builds. Start now?")) { return }
+    }
+
+    # A small batch file: load the compiler, set up the build (first time only), build xi_map.
+    # (Same commands as the GitHub workflow.)
+    New-Item -ItemType Directory -Force $script:P.Downloads | Out-Null
+    $bat = Join-Path $script:P.Downloads 'lsb-build.cmd'
+    @"
+@echo off
+call "$($tools.VcVars)" >nul || exit /b 1
+cd /d "$src"
+if exist "build\CMakeCache.txt" goto build
+echo Setting up the build (first time only)...
+cmake -S . -B build -G "Ninja Multi-Config" -DPython_EXECUTABLE="$($script:P.Python)" || exit /b 1
+:build
+echo Building xi_map...
+cmake --build build --config Release --target xi_map --parallel || exit /b 1
+"@ | Set-Content $bat -Encoding ASCII
+
+    # Turn ninja's "[123/900] Building ..." lines into the progress bar,
+    # and only show every 50th one in the log. Everything else (errors!) is shown.
+    $onLine = {
+        param([string]$line)
+        if ($line -match '^\[(\d+)/(\d+)\]') {
+            $n = [int]$Matches[1]; $total = [int]$Matches[2]
+            Set-Progress ([int](100 * $n / [Math]::Max(1, $total))) ("Building... {0} of {1}" -f $n, $total)
+            return ($n % 50 -eq 0 -or $n -eq $total)
+        }
+        return $true
+    }
+
+    Log "Building xi_map.exe from $src (using $($tools.Name))..."
+    $start = Get-Date
+    $code = Invoke-Logged $env:ComSpec "/c `"`"$bat`"`"" $src $onLine
+    if ($code -ne 0) {
+        throw "The build failed (code $code). Your server was not changed.`n`nScroll up in the log and look for lines containing 'error' - they say which file and line has the problem."
+    }
+
+    # Find the new xi_map.exe (CMake may put it in the source folder or under build\)
+    $candidates = @()
+    $rootExe = Join-Path $src 'xi_map.exe'
+    if (Test-Path $rootExe) { $candidates += Get-Item $rootExe }
+    $candidates += @(Get-ChildItem (Join-Path $src 'build') -Recurse -Filter 'xi_map.exe' -ErrorAction SilentlyContinue)
+    $built = $candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $built) { throw "The build said it worked, but no xi_map.exe was found in $src." }
+    if ($built.LastWriteTime -lt $start) { Log "Nothing changed since the last build - using the existing xi_map.exe." }
+    Log ("Build finished in {0:N0} minutes: {1}" -f ((Get-Date) - $start).TotalMinutes, $built.FullName)
+
+    # Swap it in. The map server has to be off while its file is replaced.
+    $map = $script:Components | Where-Object { $_.Key -eq 'map' }
+    if (Get-Running 'map') {
+        if (-not (Ask-YesNo "The build is done.`n`nThe map server must be stopped to swap in the new version (anyone logged in is disconnected).`n`nStop it and swap now?")) {
+            Log "New build not installed. It's waiting in $($built.FullName) - click 'Rebuild map server' again later to install it (it won't recompile)."
+            return
+        }
+        Stop-Component $map
+    }
+
+    $target  = Join-Path $script:P.Server 'xi_map.exe'
+    $release = Join-Path $script:P.Server 'xi_map.release.exe'
+    if (-not (Test-Path $release)) {
+        Copy-Item $target $release -Force
+        Log "Saved the original map server as xi_map.release.exe ('Restore original map' puts it back)."
+    }
+    Copy-Item $built.FullName $target -Force
+    # Any DLLs built next to it (needed if the build uses a newer library)
+    Get-ChildItem $built.DirectoryName -Filter '*.dll' -ErrorAction SilentlyContinue | ForEach-Object {
+        Copy-Item $_.FullName (Join-Path $script:P.Server $_.Name) -Force
+    }
+    Log "Installed your new xi_map.exe."
+    Update-DevStatus
+
+    if (Ask-YesNo "Your rebuilt map server is installed.`n`nStart the server now?") { Start-Server -QuietIfRunning }
+}
+
+# Puts back the xi_map.exe that came with the installed release
+function Restore-OriginalMap {
+    $target  = Join-Path $script:P.Server 'xi_map.exe'
+    $release = Join-Path $script:P.Server 'xi_map.release.exe'
+    if (-not (Test-Path $release)) {
+        Show-Info "The original map server is already in use - there's nothing to restore."
+        return
+    }
+    if (-not (Ask-YesNo "Put back the original map server that came with your release?`n`nYour rebuilt version is replaced (the source code is kept, so you can rebuild it any time).")) { return }
+
+    $map = $script:Components | Where-Object { $_.Key -eq 'map' }
+    $wasRunning = [bool](Get-Running 'map')
+    if ($wasRunning) {
+        if (-not (Ask-YesNo "The map server must be stopped to swap it (anyone logged in is disconnected).`n`nStop it now?")) { return }
+        Stop-Component $map
+    }
+
+    Copy-Item $release $target -Force
+    Remove-Item $release -Force
+    Log "Restored the original xi_map.exe."
+    Update-DevStatus
+
+    if ($wasRunning -and (Ask-YesNo "The original map server is back.`n`nStart it again now?")) { Start-Server -QuietIfRunning }
+}
+
+# The two lines of text in the Developer box
+function Update-DevStatus {
+    if (-not $script:P -or -not $script:DevStatus) { return }
+    $t = Find-BuildTools
+    $tools = if ($t.Ok) { "C++ build tools: found ($($t.Name))" } else { "C++ build tools: not found - click 'Check build tools' to see what to do" }
+    $srcText = if (Test-Path (Join-Path $script:P.Source '.git')) { "Source code: $($script:P.Source)" } else { 'Source code: not set up yet' }
+    $mapText = if (Test-Path (Join-Path $script:P.Server 'xi_map.release.exe')) { '     Map server: your own build' } else { '     Map server: original' }
+    $script:DevStatus.Text = "$tools`r`n$srcText$mapText"
+}
+
+# ----------------------------------------------------------------------------
 # The window
 # ----------------------------------------------------------------------------
 $font = New-Object Drawing.Font('Segoe UI', 9)
 $form = New-Object Windows.Forms.Form
 $form.Text = $AppTitle
-$form.Size = New-Object Drawing.Size(780, 640)
+$form.Size = New-Object Drawing.Size(780, 740)
 $form.StartPosition = 'CenterScreen'
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox = $false
@@ -905,23 +1175,23 @@ function New-Label([string]$text, [int]$x, [int]$y, [int]$w = 300) {
 }
 
 # --- shared bottom area: progress + log ---
-$script:StatusText = New-Label 'Ready' 12 392 620
+$script:StatusText = New-Label 'Ready' 12 492 620
 $form.Controls.Add($script:StatusText)
 $script:DarkModeBox = New-Object Windows.Forms.CheckBox
-$script:DarkModeBox.Text = 'Dark mode'; $script:DarkModeBox.Location = New-Object Drawing.Point(652, 390); $script:DarkModeBox.Size = New-Object Drawing.Size(100, 22)
+$script:DarkModeBox.Text = 'Dark mode'; $script:DarkModeBox.Location = New-Object Drawing.Point(652, 490); $script:DarkModeBox.Size = New-Object Drawing.Size(100, 22)
 $form.Controls.Add($script:DarkModeBox)
 $script:Progress = New-Object Windows.Forms.ProgressBar
-$script:Progress.Location = New-Object Drawing.Point(12, 416); $script:Progress.Size = New-Object Drawing.Size(740, 18)
+$script:Progress.Location = New-Object Drawing.Point(12, 516); $script:Progress.Size = New-Object Drawing.Size(740, 18)
 $form.Controls.Add($script:Progress)
 $script:LogBox = New-Object Windows.Forms.TextBox
 $script:LogBox.Multiline = $true; $script:LogBox.ReadOnly = $true; $script:LogBox.ScrollBars = 'Vertical'
-$script:LogBox.Location = New-Object Drawing.Point(12, 440); $script:LogBox.Size = New-Object Drawing.Size(740, 150)
+$script:LogBox.Location = New-Object Drawing.Point(12, 540); $script:LogBox.Size = New-Object Drawing.Size(740, 150)
 $script:LogBox.Font = New-Object Drawing.Font('Consolas', 8.5)
 $form.Controls.Add($script:LogBox)
 
 # --- install screen ---
 $installPanel = New-Object Windows.Forms.Panel
-$installPanel.Location = New-Object Drawing.Point(0, 0); $installPanel.Size = New-Object Drawing.Size(770, 385)
+$installPanel.Location = New-Object Drawing.Point(0, 0); $installPanel.Size = New-Object Drawing.Size(770, 485)
 $title = New-Label 'Install the LSB server' 20 20 500
 $title.Font = New-Object Drawing.Font('Segoe UI', 14, [Drawing.FontStyle]::Bold); $title.Height = 32
 $installPanel.Controls.Add($title)
@@ -948,7 +1218,7 @@ $form.Controls.Add($installPanel)
 
 # --- control panel screen ---
 $panel = New-Object Windows.Forms.Panel
-$panel.Location = New-Object Drawing.Point(0, 0); $panel.Size = New-Object Drawing.Size(770, 385); $panel.Visible = $false
+$panel.Location = New-Object Drawing.Point(0, 0); $panel.Size = New-Object Drawing.Size(770, 485); $panel.Visible = $false
 
 $statusGroup = New-Object Windows.Forms.GroupBox
 $statusGroup.Text = 'Status'; $statusGroup.Location = New-Object Drawing.Point(12, 10); $statusGroup.Size = New-Object Drawing.Size(270, 230)
@@ -1000,9 +1270,23 @@ $panel.Controls.Add($maintGroup)
 $script:InfoLabel = New-Label '' 12 290 740
 $script:InfoLabel.Height = 60
 $panel.Controls.Add($script:InfoLabel)
+
+# Developer: rebuild xi_map.exe from source (for testing C++ changes)
+$devGroup = New-Object Windows.Forms.GroupBox
+$devGroup.Text = 'Developer - rebuild the map server from source'; $devGroup.Location = New-Object Drawing.Point(12, 355); $devGroup.Size = New-Object Drawing.Size(738, 100)
+$checkToolsBtn  = New-Button 'Check build tools'    10 22 138
+$setupSourceBtn = New-Button 'Set up source'        154 22 138
+$rebuildMapBtn  = New-Button 'Rebuild map server'   298 22 138
+$restoreMapBtn  = New-Button 'Restore original map' 442 22 138
+$openSourceBtn  = New-Button 'Open source folder'   586 22 138
+$script:DevStatus = New-Label '' 10 60 715
+$script:DevStatus.Height = 34
+$devGroup.Controls.AddRange(@($checkToolsBtn, $setupSourceBtn, $rebuildMapBtn, $restoreMapBtn, $openSourceBtn, $script:DevStatus))
+$panel.Controls.Add($devGroup)
 $form.Controls.Add($panel)
 
-$script:AllButtons = @($installBtn, $browseBtn, $startBtn, $stopBtn, $restartMapBtn, $backupBtn, $dbUpdateBtn, $updateBtn, $updatePanelBtn)
+$script:AllButtons = @($installBtn, $browseBtn, $startBtn, $stopBtn, $restartMapBtn, $backupBtn, $dbUpdateBtn, $updateBtn, $updatePanelBtn,
+                       $checkToolsBtn, $setupSourceBtn, $rebuildMapBtn, $restoreMapBtn)
 function Set-ButtonsEnabled([bool]$on) { foreach ($b in $script:AllButtons) { $b.Enabled = $on } }
 
 function Update-Status {
@@ -1027,6 +1311,7 @@ function Show-Panel {
     if (Test-Path $bi) { $build = (Get-Content $bi -Raw).Trim() }
     $script:InfoLabel.Text = "Installed in: $($script:P.Root)`r`nRelease: $($script:Cfg.Release)   $build`r`nDatabase: MariaDB on 127.0.0.1:$($script:Cfg.DbPort), database '$DbName'"
     Update-Status
+    Update-DevStatus
 }
 
 # --- button actions ---
@@ -1047,6 +1332,14 @@ $openServerBtn.Add_Click({   Open-Folder $script:P.Server })
 $openModulesBtn.Add_Click({  Open-Folder (Join-Path $script:P.Server 'modules') })
 $openSettingsBtn.Add_Click({ Open-Folder (Join-Path $script:P.Server 'settings') })
 $openLogsBtn.Add_Click({     Open-Folder (Join-Path $script:P.Server 'log') })
+$checkToolsBtn.Add_Click({  Run-Action 'Check build tools' { Test-BuildToolsAction } })
+$setupSourceBtn.Add_Click({ Run-Action 'Set up source code' { Initialize-Source } })
+$rebuildMapBtn.Add_Click({  Run-Action 'Rebuild map server' { Build-MapServer } })
+$restoreMapBtn.Add_Click({  Run-Action 'Restore original map server' { Restore-OriginalMap } })
+$openSourceBtn.Add_Click({
+    if (Test-Path $script:P.Source) { Open-Folder $script:P.Source }
+    else { Show-Info "The source code isn't set up yet. Click 'Set up source' first." }
+})
 
 $timer = New-Object Windows.Forms.Timer
 $timer.Interval = 2000
