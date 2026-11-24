@@ -69,6 +69,8 @@
 #include "utils/zoneutils.h"
 #include "weapon_skill.h"
 
+#include <set>
+
 CBattleEntity::CBattleEntity()
 {
     TracyZoneScoped;
@@ -1902,8 +1904,18 @@ void CBattleEntity::addEquipModifiers(CItemEquipment* PItem)
 {
     TracyZoneScoped;
 
+    // GetScaledItemModifier already returns the item's TOTAL for a mod, so
+    // handle each mod ID only once (augments can add a second entry with
+    // the same ID, e.g. MP on an item that already has MP).
+    std::set<xi::Mod> done;
+
     for (auto& i : PItem->modList)
     {
+        if (!done.insert(i.getModID()).second)
+        {
+            continue; // already added this mod's total
+        }
+
         m_modStat[i.getModID()] += battleutils::GetScaledItemModifier(this, PItem, i.getModID());
     }
 }
@@ -2028,12 +2040,18 @@ void CBattleEntity::delEquipModifiers(CItemEquipment* PItem, bool isDelevel /* =
 {
     TracyZoneScoped;
 
+    std::set<xi::Mod> done;
+
     for (auto& i : PItem->modList)
     {
+        if (!done.insert(i.getModID()).second)
+        {
+            continue;
+        }
+
         m_modStat[i.getModID()] -= battleutils::GetScaledItemModifier(this, PItem, i.getModID(), isDelevel);
     }
 }
-
 /************************************************************************
  *                                                                      *
  *  Get the current value of the specified modifier                     *
