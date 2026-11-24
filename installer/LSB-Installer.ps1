@@ -136,10 +136,16 @@ function Set-ToolEnvironment {
     $env:PYTHONUNBUFFERED  = '1'           # show dbtool output as it happens
     $env:PYTHONIOENCODING  = 'utf-8'
     $env:PROMPT            = '$P$G'        # stops dbtool waiting for "Press ENTER" if it errors
-    # Let git work even if Windows says the folder belongs to another user account
-    $env:GIT_CONFIG_COUNT  = '1'
-    $env:GIT_CONFIG_KEY_0  = 'safe.directory'
+    # Settings for the bundled git (these win over any .gitconfig file on the PC):
+    #  - safe.directory: work even if Windows says the folder belongs to another user account
+    #  - http.sslBackend schannel: check GitHub's certificate with Windows' own certificate
+    #    store, so a .gitconfig from another Git install pointing at a certificate file
+    #    (e.g. C:\Program Files\Git\...\ca-bundle.crt) can't break downloads
+    $env:GIT_CONFIG_COUNT   = '2'
+    $env:GIT_CONFIG_KEY_0   = 'safe.directory'
     $env:GIT_CONFIG_VALUE_0 = '*'
+    $env:GIT_CONFIG_KEY_1   = 'http.sslBackend'
+    $env:GIT_CONFIG_VALUE_1 = 'schannel'
 }
 
 # ----------------------------------------------------------------------------
@@ -1008,7 +1014,7 @@ function Initialize-Source {
         if (-not (Ask-YesNo "This downloads the server's source code from github.com/$GitHubRepo into:`n$src`n`nIt's about 1-2 GB and takes a few minutes. You only do this once.`n`nContinue?")) { return }
         Set-Progress 0 'Downloading the source code...'
         if ((Invoke-Git "clone --recursive https://github.com/$GitHubRepo.git `"$src`"" $script:P.Root) -ne 0) {
-            throw "Downloading the source code failed (git clone). Check your internet connection and try again."
+            throw "Downloading the source code failed (git clone). The reason is in the log above. If it was cut off part way, check your internet connection and try again."
         }
     }
 
