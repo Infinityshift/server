@@ -23,6 +23,7 @@
 
 #include "aman.h"
 #include "data/enums/mog_house.h"
+#include "data/enums/mount.h"
 #include "data/enums/nation.h"
 #include "data/enums/title.h"
 #include "enums/char_persist.h"
@@ -362,8 +363,8 @@ using BazaarList_t  = std::vector<EntityId>;
 
 struct ItemLocation
 {
-    CONTAINER_ID Container{};
-    uint8        Slot{};
+    xi::Container Container{};
+    uint8         Slot{};
 };
 
 constexpr uint8 EquipSlotCount = 18;
@@ -442,7 +443,7 @@ public:
     std::array<uint8, 20> m_SetBlueSpells{}; // The 0x200 offsetted blue magic spell IDs which the user has set. (1 byte per spell)
 
     ChocoboUserData_t m_chocoboUserData{};
-    uint8             m_mountId{}; // Do not reset to 0. Only update when the mount changes.
+    xi::Mount         m_mountId{}; // Do not reset to 0. Only update when the mount changes.
     uint32            m_claimedDeeds[5]{};
     uint32            m_uniqueEvents[5]{};
 
@@ -564,7 +565,7 @@ public:
     bool                    retriggerLatents; // used to retrigger all latent effects if some event requires them to be retriggered
 
     EntityId guildShopNpc_{}; // Lua-driven guild shop NPC the PC last opened
-    auto     getStorage(uint8 locationId) const -> CItemContainer*;
+    auto     getStorage(xi::Container locationId) const -> CItemContainer*;
 
     CTradeContainer* TradeContainer; // Container used specifically for trading.
     CTradeContainer* Container;      // Universal container for exchange, synthesis, store, etc.
@@ -628,7 +629,7 @@ public:
     }
 
     // free slots of the location that open transactions keep counted as used
-    auto heldSlots(uint8 location) const -> uint8;
+    auto heldSlots(xi::Container location) const -> uint8;
 
     void clearTransactions()
     {
@@ -811,7 +812,7 @@ public:
 
     /* State callbacks */
     auto CanAttack(CBattleEntity* PTarget, std::unique_ptr<CBasicPacket>& errMsg) -> bool override;
-    auto OnAttack(CAttackState&, action_t&) -> bool override;
+    auto OnAttack(CBattleEntity* PTarget, action_t& action) -> bool override;
     auto OnAttackError(CAttackState&) -> bool override;
     auto IsValidTarget(uint16 targid, xi::TargetType validTargetFlags, std::unique_ptr<CBasicPacket>& errMsg) -> CBattleEntity* override;
     auto IsValidTarget(EntityId target, xi::TargetType validTargetFlags, std::unique_ptr<CBasicPacket>& errMsg) -> CBattleEntity* override;
@@ -819,7 +820,7 @@ public:
     void OnEngage(CAttackState&) override;
     void OnDisengage(CAttackState&) override;
     void OnCastFinished(CMagicState&, action_t&) override;
-    void OnCastInterrupted(CMagicState&, action_t&, MsgBasic msg, bool blockedCast) override;
+    void OnCastInterrupted(CMagicState&, action_t&, xi::MsgBasic msg, bool blockedCast) override;
     void OnWeaponSkillFinished(CWeaponSkillState&, action_t&) override;
     void OnAbility(CAbilityState&, action_t&) override;
     void OnDeathTimer() override;

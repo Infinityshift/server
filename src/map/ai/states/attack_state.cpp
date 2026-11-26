@@ -97,7 +97,7 @@ auto CAttackState::Update(timer::time_point tick) -> bool
                 return true;
             }
             action_t action{};
-            if (m_PEntity->OnAttack(*this, action))
+            if (m_PEntity->OnAttack(PTarget, action))
             {
                 // TODO: what about AoE auto attacks?
                 battleutils::handleKillshotEnmity(m_PEntity, PTarget);
@@ -175,7 +175,7 @@ void CAttackState::UpdateTarget(const EntityId& target)
                             auto PBattleTarget = static_cast<CBattleEntity*>(PPotentialTarget.second);
 
                             PChar->pushPacket<GP_SERV_COMMAND_ASSIST>(PChar, PBattleTarget);
-                            PChar->pushPacket<GP_SERV_COMMAND_BATTLE_MESSAGE>(PChar, PBattleTarget, 0, 0, MsgBasic::AutoTargeting);
+                            PChar->pushPacket<GP_SERV_COMMAND_BATTLE_MESSAGE>(PChar, PBattleTarget, 0, 0, xi::MsgBasic::AutoTargeting);
                             break;
                         }
                     }
